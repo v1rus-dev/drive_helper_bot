@@ -1,0 +1,9 @@
+# DriveHelper dependencies.
+# Versions verified against PyPI on 2026-07-05 — pinned intentionally, do not bump without re-checking.
+aiogram==3.29.1
+SQLAlchemy==2.0.51
+aiosqlite==0.22.1
+APScheduler==3.11.3
+pydantic-settings==2.14.2
+# Let pydantic-settings pull a compatible pydantic 2.x; pin the major range explicitly.
+pydantic>=2.9,<3
