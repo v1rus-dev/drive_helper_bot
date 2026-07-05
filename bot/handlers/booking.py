@@ -11,23 +11,29 @@ from aiogram.filters import StateFilter
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.callbacks import BookingActionCB, DateCB, ReminderCB, SlotCB
+from bot.callbacks import (
+    BookingActionCB,
+    CalendarIgnoreCB,
+    CalendarNavCB,
+    DateCB,
+    ReminderCB,
+    SlotCB,
+)
 from bot.config import Settings
 from bot.db.models import User
 from bot.db.repositories import (
     get_active_bookings_for_user,
     get_booking,
+    get_free_slot_dates,
     get_free_slots_on_date,
     get_slot,
-    get_upcoming_free_slots,
 )
 from bot.keyboards import (
     BTN_BOOK,
     BTN_MY,
     NO_REMINDER,
     booking_actions_inline,
-    dates_inline,
-    distinct_local_dates,
+    build_calendar,
     reminder_inline,
     times_inline,
 )
@@ -39,14 +45,33 @@ logger = logging.getLogger(__name__)
 router = Router(name="booking")
 
 
+async def _calendar_params(
+    session: AsyncSession,
+) -> Optional[tuple[set[date], tuple[int, int], tuple[int, int]]]:
+    """Available dates plus the (year, month) bounds, or ``None`` when there are none.
+
+    Dates are school-TZ dates; the month bounds come from the earliest / latest
+    available date so navigation can be clamped to months that actually have slots.
+    """
+    dates = await get_free_slot_dates(session)
+    if not dates:
+        return None
+    earliest, latest = min(dates), max(dates)
+    return dates, (earliest.year, earliest.month), (latest.year, latest.month)
+
+
 async def _send_date_picker(message: Message, session: AsyncSession) -> None:
-    """Show the picker of dates that currently have free slots."""
-    slots = await get_upcoming_free_slots(session)
-    if not slots:
+    """Show the inline calendar for the first month that has free slots."""
+    params = await _calendar_params(session)
+    if params is None:
         await message.answer("Сейчас нет свободных слотов. Загляните позже.")
         return
-    dates = distinct_local_dates(slots)
-    await message.answer("Выберите дату:", reply_markup=dates_inline(dates))
+    dates, min_month, max_month = params
+    year, month = min_month  # first available month
+    await message.answer(
+        "Выберите дату:",
+        reply_markup=build_calendar(year, month, dates, min_month, max_month),
+    )
 
 
 @router.message(StateFilter(None), F.text == BTN_BOOK)
@@ -78,6 +103,33 @@ async def pick_date(
         f"Свободное время на {chosen.strftime('%d.%m.%Y')}:",
         reply_markup=times_inline(slots),
     )
+    await callback.answer()
+
+
+@router.callback_query(CalendarNavCB.filter())
+async def navigate_calendar(
+    callback: CallbackQuery, callback_data: CalendarNavCB, session: AsyncSession
+) -> None:
+    """Re-render the calendar for the requested month, clamped to the slot range."""
+    params = await _calendar_params(session)
+    if params is None:
+        await callback.message.edit_text("Сейчас нет свободных слотов. Загляните позже.")
+        await callback.answer()
+        return
+    dates, min_month, max_month = params
+    # Clamp defensively: the arrows already hide out-of-range months, but callback
+    # data is client-supplied and the available range may shift between renders.
+    target = min(max((callback_data.year, callback_data.month), min_month), max_month)
+    year, month = target
+    await callback.message.edit_reply_markup(
+        reply_markup=build_calendar(year, month, dates, min_month, max_month)
+    )
+    await callback.answer()
+
+
+@router.callback_query(CalendarIgnoreCB.filter())
+async def ignore_calendar_tap(callback: CallbackQuery) -> None:
+    """No-op tap on a placeholder / disabled arrow / label — just clear the spinner."""
     await callback.answer()
 
 
@@ -114,10 +166,12 @@ async def choose_reminder(
     callback_data: ReminderCB,
     session: AsyncSession,
     bot,
+    user: Optional[User],
 ) -> None:
     """Store the reminder preference and schedule it when it is still ahead."""
     booking = await get_booking(session, callback_data.booking_id)
-    if booking is None:
+    # Ownership guard: booking_id comes from attacker-controllable callback data.
+    if booking is None or user is None or booking.user_id != user.tg_id:
         await callback.answer("Запись не найдена", show_alert=True)
         return
 
@@ -166,13 +220,19 @@ async def my_bookings(
 
 @router.callback_query(BookingActionCB.filter(F.action == "cancel"))
 async def cancel_action(
-    callback: CallbackQuery, callback_data: BookingActionCB, session: AsyncSession
+    callback: CallbackQuery,
+    callback_data: BookingActionCB,
+    session: AsyncSession,
+    user: Optional[User],
 ) -> None:
-    """Cancel a booking, free the slot and drop its reminder."""
-    booking = await cancel_booking(session, callback_data.booking_id)
-    if booking is None:
+    """Cancel a booking (owner only), free the slot and drop its reminder."""
+    booking = await get_booking(session, callback_data.booking_id)
+    # Ownership guard: booking_id comes from attacker-controllable callback data.
+    if booking is None or user is None or booking.user_id != user.tg_id:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    # expected_user_id re-checks ownership at the data layer (defense in depth).
+    await cancel_booking(session, callback_data.booking_id, expected_user_id=user.tg_id)
     await callback.message.edit_text("Запись отменена.")
     await callback.answer()
 
@@ -182,12 +242,16 @@ async def reschedule_action(
     callback: CallbackQuery,
     callback_data: BookingActionCB,
     session: AsyncSession,
+    user: Optional[User],
 ) -> None:
-    """Reschedule: cancel the current booking, then start picking a new slot."""
-    booking = await cancel_booking(session, callback_data.booking_id)
-    if booking is None:
+    """Reschedule (owner only): cancel the current booking, then pick a new slot."""
+    booking = await get_booking(session, callback_data.booking_id)
+    # Ownership guard: booking_id comes from attacker-controllable callback data.
+    if booking is None or user is None or booking.user_id != user.tg_id:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    # expected_user_id re-checks ownership at the data layer (defense in depth).
+    await cancel_booking(session, callback_data.booking_id, expected_user_id=user.tg_id)
     await callback.message.edit_text("Прежняя запись отменена. Выберите новое время.")
     await _send_date_picker(callback.message, session)
     await callback.answer()

@@ -25,3 +25,16 @@ class RemoveModerator(StatesGroup):
 
 class DaySchedule(StatesGroup):
     date = State()
+
+
+class AssignTeacher(StatesGroup):
+    tg_id = State()
+
+
+class RemoveTeacher(StatesGroup):
+    tg_id = State()
+
+
+class EditProfile(StatesGroup):
+    full_name = State()
+    phone = State()

@@ -65,9 +65,17 @@ async def apply_reminder(
     return False
 
 
-async def cancel_booking(session: AsyncSession, booking_id: int) -> Optional[Booking]:
-    """Cancel a booking, free its slot and drop any scheduled reminder."""
-    booking = await repo_cancel_booking(session, booking_id)
+async def cancel_booking(
+    session: AsyncSession,
+    booking_id: int,
+    expected_user_id: Optional[int] = None,
+) -> Optional[Booking]:
+    """Cancel a booking, free its slot and drop any scheduled reminder.
+
+    ``expected_user_id`` is passed through as an ownership guard: the booking
+    is only cancelled when it belongs to that user.
+    """
+    booking = await repo_cancel_booking(session, booking_id, expected_user_id)
     if booking is not None:
         remove_reminder(booking_id)
     return booking

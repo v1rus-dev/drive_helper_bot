@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,9 +36,33 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    @field_validator("admin_ids")
+    @classmethod
+    def _validate_admin_ids(cls, value: str) -> str:
+        """Fail fast at startup if ADMIN_IDS holds a non-numeric token.
+
+        Guarantees ``admin_id_list`` can never raise ``ValueError`` deep inside
+        per-update request handling (e.g. someone puts @usernames in ADMIN_IDS).
+        """
+        for part in value.split(","):
+            token = part.strip()
+            if not token:
+                continue
+            try:
+                int(token)
+            except ValueError:
+                raise ValueError(
+                    f"ADMIN_IDS должен содержать числовые Telegram id через запятую, "
+                    f"а не @username; некорректное значение: «{token}»"
+                ) from None
+        return value
+
     @property
     def admin_id_list(self) -> list[int]:
-        """Parsed list of admin Telegram ids (empty string -> ``[]``)."""
+        """Parsed list of admin Telegram ids (empty string -> ``[]``).
+
+        Input is guaranteed numeric by the ``admin_ids`` validator above.
+        """
         return [int(part.strip()) for part in self.admin_ids.split(",") if part.strip()]
 
     @property

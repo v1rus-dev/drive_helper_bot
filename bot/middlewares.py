@@ -38,13 +38,15 @@ class AuthMiddleware(BaseMiddleware):
             tg_id = event.from_user.id if event.from_user else None
             user = await get_user(session, tg_id) if tg_id is not None else None
 
-            # Keep DB role aligned with env authority for existing users.
-            if (
-                user is not None
-                and is_admin(user.tg_id, settings)
-                and user.role != UserRole.admin
-            ):
-                user = await set_role(session, user.tg_id, UserRole.admin)
+            # Keep the DB role symmetrically aligned with env authority for
+            # existing users: promote to admin when in ADMIN_IDS, and demote a
+            # stale stored admin back to student when no longer in ADMIN_IDS
+            # (so de-provisioning actually revokes moderator-level access).
+            if user is not None:
+                if is_admin(user.tg_id, settings) and user.role != UserRole.admin:
+                    user = await set_role(session, user.tg_id, UserRole.admin)
+                elif not is_admin(user.tg_id, settings) and user.role == UserRole.admin:
+                    user = await set_role(session, user.tg_id, UserRole.student)
 
             data["user"] = user
 

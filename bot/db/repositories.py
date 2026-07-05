@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.db.models import Booking, BookingStatus, Slot, SlotStatus, User, UserRole
-from bot.utils import local_to_utc, utcnow
+from bot.utils import local_to_utc, to_local, utcnow
 
 
 # --- Users ---------------------------------------------------------------
@@ -50,6 +50,32 @@ async def set_role(session: AsyncSession, tg_id: int, role: UserRole) -> Optiona
     return user
 
 
+async def update_user_name(
+    session: AsyncSession, tg_id: int, full_name: str
+) -> Optional[User]:
+    """Update a user's full name. Returns the updated user, or ``None``."""
+    user = await session.get(User, tg_id)
+    if user is None:
+        return None
+    user.full_name = full_name
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def update_user_phone(
+    session: AsyncSession, tg_id: int, phone: str
+) -> Optional[User]:
+    """Update a user's phone number. Returns the updated user, or ``None``."""
+    user = await session.get(User, tg_id)
+    if user is None:
+        return None
+    user.phone = phone
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 # --- Slots ---------------------------------------------------------------
 
 async def get_slot(session: AsyncSession, slot_id: int) -> Optional[Slot]:
@@ -57,14 +83,66 @@ async def get_slot(session: AsyncSession, slot_id: int) -> Optional[Slot]:
     return await session.get(Slot, slot_id)
 
 
-async def get_upcoming_free_slots(session: AsyncSession) -> Sequence[Slot]:
-    """All free slots starting in the future, ordered by start time."""
+async def get_upcoming_free_slots(
+    session: AsyncSession, horizon_days: int = 60
+) -> Sequence[Slot]:
+    """Free slots starting within the next ``horizon_days``, ordered by start.
+
+    The horizon caps how many distinct dates the picker can offer, keeping the
+    inline date keyboard well under Telegram's ~100-button limit.
+    """
+    # TODO: paginate if horizon still exceeds ~100 dates
+    now = utcnow()
+    horizon = now + timedelta(days=horizon_days)
     stmt = (
         select(Slot)
-        .where(Slot.status == SlotStatus.free, Slot.starts_at > utcnow())
+        .where(
+            Slot.status == SlotStatus.free,
+            Slot.starts_at > now,
+            Slot.starts_at <= horizon,
+        )
         .order_by(Slot.starts_at)
     )
     return (await session.execute(stmt)).scalars().all()
+
+
+async def get_free_slot_dates(session: AsyncSession) -> set[date]:
+    """Set of local (school-TZ) calendar dates that have at least one free slot.
+
+    Reuses :func:`get_upcoming_free_slots` (already capped at the 60-day horizon)
+    and groups by the slot's *school-TZ* date — a slot at 23:00 UTC belongs to the
+    next day in Europe/Minsk, so grouping must not be done on the naive-UTC value.
+    """
+    slots = await get_upcoming_free_slots(session)
+    return {to_local(slot.starts_at).date() for slot in slots}
+
+
+async def get_upcoming_slots(
+    session: AsyncSession, horizon_days: int = 60
+) -> Sequence[Slot]:
+    """All slots (free *and* booked) starting within the next ``horizon_days``.
+
+    Unlike :func:`get_upcoming_free_slots` this is not filtered by status — it
+    backs the read-only schedule / staff overview, which show occupancy too.
+    """
+    now = utcnow()
+    horizon = now + timedelta(days=horizon_days)
+    stmt = (
+        select(Slot)
+        .where(Slot.starts_at > now, Slot.starts_at <= horizon)
+        .order_by(Slot.starts_at)
+    )
+    return (await session.execute(stmt)).scalars().all()
+
+
+async def get_all_slot_dates(session: AsyncSession, horizon_days: int = 60) -> set[date]:
+    """Local (school-TZ) dates that have at least one slot of *any* status.
+
+    Mirrors :func:`get_free_slot_dates` (same to_local grouping) but over all
+    slots, so the read-only schedule calendar highlights every day with a slot.
+    """
+    slots = await get_upcoming_slots(session, horizon_days)
+    return {to_local(slot.starts_at).date() for slot in slots}
 
 
 def _local_day_bounds_utc(local_date: date) -> tuple[datetime, datetime]:
@@ -84,6 +162,27 @@ async def get_free_slots_on_date(
         select(Slot)
         .where(
             Slot.status == SlotStatus.free,
+            Slot.starts_at > utcnow(),
+            Slot.starts_at >= start_utc,
+            Slot.starts_at < end_utc,
+        )
+        .order_by(Slot.starts_at)
+    )
+    return (await session.execute(stmt)).scalars().all()
+
+
+async def get_all_slots_on_date(
+    session: AsyncSession, local_date: date
+) -> Sequence[Slot]:
+    """Future slots of *any* status on the given local day, ordered by start.
+
+    Backs the student read-only schedule — it deliberately returns only the
+    slots (no booking / user join) so the caller cannot leak who booked a slot.
+    """
+    start_utc, end_utc = _local_day_bounds_utc(local_date)
+    stmt = (
+        select(Slot)
+        .where(
             Slot.starts_at > utcnow(),
             Slot.starts_at >= start_utc,
             Slot.starts_at < end_utc,
@@ -216,13 +315,22 @@ async def get_active_bookings_for_user(
     return [(row[0], row[1]) for row in rows]
 
 
-async def cancel_booking(session: AsyncSession, booking_id: int) -> Optional[Booking]:
+async def cancel_booking(
+    session: AsyncSession,
+    booking_id: int,
+    expected_user_id: Optional[int] = None,
+) -> Optional[Booking]:
     """Cancel a booking and free its slot. Returns the booking, or ``None``.
 
-    Idempotent: an already-cancelled booking is returned unchanged.
+    Idempotent: an already-cancelled booking is returned unchanged. When
+    ``expected_user_id`` is given, the booking is only touched if it belongs to
+    that user (ownership guard / defense in depth against IDOR); a mismatch
+    returns ``None`` and mutates nothing.
     """
     booking = await session.get(Booking, booking_id)
     if booking is None:
+        return None
+    if expected_user_id is not None and booking.user_id != expected_user_id:
         return None
     if booking.status == BookingStatus.active:
         booking.status = BookingStatus.cancelled

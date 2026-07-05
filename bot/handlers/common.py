@@ -12,10 +12,18 @@ from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import Settings, is_admin
-from bot.db.models import User, UserRole, is_moderator_or_admin
+from bot.db.models import (
+    User,
+    UserRole,
+    can_view_staff_schedule,
+    effective_role,
+    is_moderator_or_admin,
+    is_teacher,
+)
 from bot.db.repositories import create_user
 from bot.keyboards import BTN_HELP, main_menu, phone_request
 from bot.states import Registration
+from bot.utils import clean_full_name, normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +32,8 @@ router = Router(name="common")
 
 def _menu_for(user: Optional[User], settings: Settings) -> "object":
     """Reply keyboard for the given user's effective role."""
-    tg_id = user.tg_id if user else 0
-    admin = is_admin(tg_id, settings)
-    moderator = is_moderator_or_admin(user, settings)
-    return main_menu(is_moderator=moderator, is_admin=admin)
+    role = effective_role(user, settings) or UserRole.student
+    return main_menu(role)
 
 
 async def show_main_menu(message: Message, user: Optional[User], settings: Settings) -> None:
@@ -59,9 +65,12 @@ async def cmd_start(
 @router.message(Registration.full_name, F.text)
 async def reg_full_name(message: Message, state: FSMContext) -> None:
     """Save the full name and ask for a phone number."""
-    full_name = (message.text or "").strip()
-    if not full_name:
-        await message.answer("Имя не может быть пустым. Попробуйте ещё раз.")
+    full_name = clean_full_name(message.text)
+    if full_name is None:
+        await message.answer(
+            "Имя не может быть пустым и должно быть не длиннее 100 символов. "
+            "Попробуйте ещё раз."
+        )
         return
     await state.update_data(full_name=full_name)
     await message.answer(
@@ -69,6 +78,12 @@ async def reg_full_name(message: Message, state: FSMContext) -> None:
         reply_markup=phone_request(),
     )
     await state.set_state(Registration.phone)
+
+
+@router.message(Registration.full_name, ~F.text)
+async def reg_full_name_invalid(message: Message) -> None:
+    """Non-text input while entering the name — re-prompt (avoids a silent drop)."""
+    await message.answer("Напишите имя и фамилию текстом.")
 
 
 @router.message(Registration.phone)
@@ -79,12 +94,10 @@ async def reg_phone(
     settings: Settings,
 ) -> None:
     """Save the phone, create the user (admin if in ADMIN_IDS) and show menu."""
-    if message.contact is not None:
-        phone = message.contact.phone_number
-    else:
-        phone = (message.text or "").strip()
+    contact_phone = message.contact.phone_number if message.contact is not None else None
+    phone = normalize_phone(contact_phone, message.text)
 
-    if not phone:
+    if phone is None:
         await message.answer(
             "Не удалось получить номер. Отправьте его кнопкой или введите вручную."
         )
@@ -109,20 +122,31 @@ async def reg_phone(
 @router.message(StateFilter(None), F.text == BTN_HELP)
 async def cmd_help(message: Message, user: Optional[User], settings: Settings) -> None:
     """Show role-aware help text."""
-    lines = [
-        "<b>Помощь</b>",
-        "",
-        "• «Записаться» — выбрать свободное время и записаться на занятие.",
-        "• «Мои записи» — посмотреть, отменить или перенести записи.",
-    ]
-    if is_moderator_or_admin(user, settings):
+    lines = ["<b>Помощь</b>", ""]
+    role = effective_role(user, settings) or UserRole.student
+    if role == UserRole.student:
         lines += [
-            "• «Добавить слоты» — создать свободные слоты на дату.",
-            "• «Расписание на день» — посмотреть занятость на день.",
+            "• «Записаться» — выбрать свободное время и записаться на занятие.",
+            "• «Мои записи» — посмотреть, отменить или перенести записи.",
+            "• «Расписание» — посмотреть свободные и занятые слоты по дням.",
         ]
+    if can_view_staff_schedule(user, settings):
+        lines.append(
+            "• «Расписание на день» — занятость на день с ФИО и телефоном учеников."
+        )
+    if is_teacher(user, settings):
+        lines.append("• «Все слоты» — ближайшие слоты со статусом занятости.")
+    if is_moderator_or_admin(user, settings):
+        lines.append("• «Добавить слоты» — создать свободные слоты на дату.")
     if is_admin(user.tg_id if user else 0, settings):
         lines += [
-            "• «Назначить модератора» / «Снять модератора» — управление ролями.",
+            "• «Все слоты» — ближайшие слоты со статусом занятости.",
+            "• «Назначить/Снять модератора» — управление модераторами.",
+            "• «Назначить/Снять преподавателя» — управление преподавателями.",
         ]
-    lines += ["", "Команда /start открывает главное меню."]
+    lines += [
+        "• «Мой профиль» — посмотреть и изменить ФИО и телефон.",
+        "",
+        "Команда /start открывает главное меню.",
+    ]
     await message.answer("\n".join(lines))

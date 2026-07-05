@@ -12,7 +12,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot.config import get_settings
 from bot.db.database import get_sessionmaker, init_db
-from bot.handlers import admin, booking, common, moderator
+from bot.handlers import admin, booking, common, moderator, profile, schedule
 from bot.middlewares import AuthMiddleware
 from bot.services.reminders import (
     init_scheduler,
@@ -52,6 +52,8 @@ async def main() -> None:
     # Routers — common first so /start and registration take priority.
     dp.include_router(common.router)
     dp.include_router(booking.router)
+    dp.include_router(schedule.router)
+    dp.include_router(profile.router)
     dp.include_router(moderator.router)
     dp.include_router(admin.router)
 
