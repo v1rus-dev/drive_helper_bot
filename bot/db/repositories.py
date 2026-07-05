@@ -9,12 +9,20 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from typing import Optional, Sequence
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import Booking, BookingStatus, Slot, SlotStatus, User, UserRole
-from bot.utils import local_to_utc, to_local, utcnow
+from bot.db.models import (
+    AppSetting,
+    Booking,
+    BookingStatus,
+    Slot,
+    SlotStatus,
+    User,
+    UserRole,
+)
+from bot.utils import combine_local_to_utc, format_time, local_to_utc, parse_local_time, utcnow
 
 
 # --- Users ---------------------------------------------------------------
@@ -28,15 +36,35 @@ async def create_user(
     session: AsyncSession,
     tg_id: int,
     full_name: str,
-    phone: str,
     role: UserRole = UserRole.student,
 ) -> User:
     """Insert a new user and return it."""
-    user = User(tg_id=tg_id, full_name=full_name, phone=phone, role=role)
+    user = User(tg_id=tg_id, full_name=full_name, role=role)
     session.add(user)
     await session.commit()
     await session.refresh(user)
     return user
+
+
+async def get_users_by_role(
+    session: AsyncSession, role: UserRole
+) -> Sequence[User]:
+    """Users with the given stored role, ordered by ФИО (case-insensitive)."""
+    stmt = (
+        select(User)
+        .where(User.role == role)
+        .order_by(User.full_name.collate("NOCASE"))
+    )
+    return (await session.execute(stmt)).scalars().all()
+
+
+async def get_all_users(session: AsyncSession) -> Sequence[User]:
+    """All registered users, ordered by ФИО (case-insensitive).
+
+    Backs the staff «Управление записями» manual-booking user picker.
+    """
+    stmt = select(User).order_by(User.full_name.collate("NOCASE"))
+    return (await session.execute(stmt)).scalars().all()
 
 
 async def set_role(session: AsyncSession, tg_id: int, role: UserRole) -> Optional[User]:
@@ -63,19 +91,6 @@ async def update_user_name(
     return user
 
 
-async def update_user_phone(
-    session: AsyncSession, tg_id: int, phone: str
-) -> Optional[User]:
-    """Update a user's phone number. Returns the updated user, or ``None``."""
-    user = await session.get(User, tg_id)
-    if user is None:
-        return None
-    user.phone = phone
-    await session.commit()
-    await session.refresh(user)
-    return user
-
-
 # --- Slots ---------------------------------------------------------------
 
 async def get_slot(session: AsyncSession, slot_id: int) -> Optional[Slot]:
@@ -83,66 +98,80 @@ async def get_slot(session: AsyncSession, slot_id: int) -> Optional[Slot]:
     return await session.get(Slot, slot_id)
 
 
-async def get_upcoming_free_slots(
-    session: AsyncSession, horizon_days: int = 60
-) -> Sequence[Slot]:
-    """Free slots starting within the next ``horizon_days``, ordered by start.
+async def get_slots_in_range(
+    session: AsyncSession, start_utc: datetime, end_utc: datetime
+) -> list[tuple[Slot, Optional[Booking], Optional[User]]]:
+    """All slots (any status) in ``[start, end)`` with active booking + booker.
 
-    The horizon caps how many distinct dates the picker can offer, keeping the
-    inline date keyboard well under Telegram's ~100-button limit.
+    Backs the weekly schedule view. The active booking and its user's ФИО are
+    eagerly joined so the caller renders each row without a per-row query. The
+    range is a naive-UTC half-open interval (week bounds are computed in the
+    school TZ, then converted — see :func:`bot.utils.get_week_bounds`).
     """
-    # TODO: paginate if horizon still exceeds ~100 dates
-    now = utcnow()
-    horizon = now + timedelta(days=horizon_days)
+    stmt = (
+        select(Slot, Booking, User)
+        .outerjoin(
+            Booking,
+            and_(
+                Booking.slot_id == Slot.id,
+                Booking.status == BookingStatus.active,
+            ),
+        )
+        .outerjoin(User, User.tg_id == Booking.user_id)
+        .where(Slot.starts_at >= start_utc, Slot.starts_at < end_utc)
+        .order_by(Slot.starts_at)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [(row[0], row[1], row[2]) for row in rows]
+
+
+async def get_free_slots_in_range(
+    session: AsyncSession, start_utc: datetime, end_utc: datetime
+) -> Sequence[Slot]:
+    """Free, still-upcoming slots in ``[start, end)``, ordered by start.
+
+    Backs the booking day picker: only free slots whose start is still in the
+    future are offered.
+    """
     stmt = (
         select(Slot)
         .where(
             Slot.status == SlotStatus.free,
-            Slot.starts_at > now,
-            Slot.starts_at <= horizon,
+            Slot.starts_at > utcnow(),
+            Slot.starts_at >= start_utc,
+            Slot.starts_at < end_utc,
         )
         .order_by(Slot.starts_at)
     )
     return (await session.execute(stmt)).scalars().all()
 
 
-async def get_free_slot_dates(session: AsyncSession) -> set[date]:
-    """Set of local (school-TZ) calendar dates that have at least one free slot.
+async def has_slots_after(session: AsyncSession, end_utc: datetime) -> bool:
+    """Whether any slot (any status) starts at/after ``end_utc``.
 
-    Reuses :func:`get_upcoming_free_slots` (already capped at the 60-day horizon)
-    and groups by the slot's *school-TZ* date — a slot at 23:00 UTC belongs to the
-    next day in Europe/Minsk, so grouping must not be done on the naive-UTC value.
+    Decides whether the weekly schedule's next-week ``›`` button is shown.
     """
-    slots = await get_upcoming_free_slots(session)
-    return {to_local(slot.starts_at).date() for slot in slots}
-
-
-async def get_upcoming_slots(
-    session: AsyncSession, horizon_days: int = 60
-) -> Sequence[Slot]:
-    """All slots (free *and* booked) starting within the next ``horizon_days``.
-
-    Unlike :func:`get_upcoming_free_slots` this is not filtered by status — it
-    backs the read-only schedule / staff overview, which show occupancy too.
-    """
-    now = utcnow()
-    horizon = now + timedelta(days=horizon_days)
-    stmt = (
-        select(Slot)
-        .where(Slot.starts_at > now, Slot.starts_at <= horizon)
-        .order_by(Slot.starts_at)
+    slot_id = await session.scalar(
+        select(Slot.id).where(Slot.starts_at >= end_utc).limit(1)
     )
-    return (await session.execute(stmt)).scalars().all()
+    return slot_id is not None
 
 
-async def get_all_slot_dates(session: AsyncSession, horizon_days: int = 60) -> set[date]:
-    """Local (school-TZ) dates that have at least one slot of *any* status.
+async def has_free_slots_after(session: AsyncSession, end_utc: datetime) -> bool:
+    """Whether any free, still-upcoming slot starts at/after ``end_utc``.
 
-    Mirrors :func:`get_free_slot_dates` (same to_local grouping) but over all
-    slots, so the read-only schedule calendar highlights every day with a slot.
+    Decides whether the booking view's next-week ``›`` button is shown.
     """
-    slots = await get_upcoming_slots(session, horizon_days)
-    return {to_local(slot.starts_at).date() for slot in slots}
+    slot_id = await session.scalar(
+        select(Slot.id)
+        .where(
+            Slot.status == SlotStatus.free,
+            Slot.starts_at > utcnow(),
+            Slot.starts_at >= end_utc,
+        )
+        .limit(1)
+    )
+    return slot_id is not None
 
 
 def _local_day_bounds_utc(local_date: date) -> tuple[datetime, datetime]:
@@ -162,27 +191,6 @@ async def get_free_slots_on_date(
         select(Slot)
         .where(
             Slot.status == SlotStatus.free,
-            Slot.starts_at > utcnow(),
-            Slot.starts_at >= start_utc,
-            Slot.starts_at < end_utc,
-        )
-        .order_by(Slot.starts_at)
-    )
-    return (await session.execute(stmt)).scalars().all()
-
-
-async def get_all_slots_on_date(
-    session: AsyncSession, local_date: date
-) -> Sequence[Slot]:
-    """Future slots of *any* status on the given local day, ordered by start.
-
-    Backs the student read-only schedule — it deliberately returns only the
-    slots (no booking / user join) so the caller cannot leak who booked a slot.
-    """
-    start_utc, end_utc = _local_day_bounds_utc(local_date)
-    stmt = (
-        select(Slot)
-        .where(
             Slot.starts_at > utcnow(),
             Slot.starts_at >= start_utc,
             Slot.starts_at < end_utc,
@@ -254,6 +262,112 @@ async def free_slot(session: AsyncSession, slot_id: int) -> None:
     await session.commit()
 
 
+async def delete_free_slot(session: AsyncSession, slot_id: int) -> bool:
+    """Delete a slot only if it is genuinely free with no active booking.
+
+    Returns ``True`` if the slot was deleted, ``False`` otherwise.
+
+    TOCTOU safety: an ACTIVE booking row is NEVER deleted, under any timing.
+    Only *cancelled* booking rows are removed (they carry no user-facing state —
+    only active bookings are ever shown or reminded — and exist solely to satisfy
+    the FK once the now-free slot is deleted, since ``PRAGMA foreign_keys=ON``).
+    The slot delete is a single guarded statement whose ``WHERE`` re-checks
+    ``status='free'`` AND ``NOT EXISTS`` an active booking in the *same* SQL
+    statement, so a booking inserted concurrently in the await window cannot be
+    lost: the guarded delete simply affects 0 rows and the whole unit of work is
+    rolled back (undoing the cancelled-booking cleanup as well).
+    """
+    # Remove only cancelled booking rows referencing this slot; active rows are
+    # left untouched so a concurrent booking is never destroyed.
+    await session.execute(
+        delete(Booking).where(
+            Booking.slot_id == slot_id,
+            Booking.status == BookingStatus.cancelled,
+        )
+    )
+    # Guarded, atomic slot delete. The correlated NOT EXISTS is evaluated in the
+    # same statement as the status check, so an active booking (pre-existing or
+    # concurrently inserted) blocks the delete instead of orphaning the slot.
+    active_exists = (
+        select(Booking.id)
+        .where(
+            Booking.slot_id == slot_id,
+            Booking.status == BookingStatus.active,
+        )
+        .exists()
+    )
+    result = await session.execute(
+        delete(Slot).where(
+            Slot.id == slot_id,
+            Slot.status == SlotStatus.free,
+            ~active_exists,
+        )
+    )
+    if result.rowcount > 0:
+        await session.commit()
+        return True
+    # Slot was booked / taken / gone -> roll back, undoing the cancelled cleanup.
+    await session.rollback()
+    return False
+
+
+async def apply_day_override(
+    session: AsyncSession,
+    local_date: date,
+    selected_times: Sequence[str],
+    created_by: int,
+    duration_min: int,
+) -> tuple[int, int, list[str]]:
+    """Make a local day's slots match ``selected_times`` exactly (override).
+
+    Shared by both the per-day edit and the set-whole-week flows. Behaviour:
+
+    * newly-selected times with no slot yet are created as FREE slots — times
+      already in the past are skipped (never create dead, unbookable slots) and
+      duplicates are skipped by :func:`create_slots`;
+    * previously-existing times that were DESELECTED are removed, but only when
+      the slot is genuinely free — the delete goes through the race-safe
+      :func:`delete_free_slot`, so a booked slot (or one booked concurrently in
+      the await window) is NEVER destroyed;
+    * booked slots whose time was deselected are PRESERVED and their ``HH:MM``
+      returned so the caller can warn the teacher.
+
+    ``created_by`` / ``duration_min`` are threaded through for the created slots
+    (a valid ``users.tg_id`` and the configured slot length). Returns
+    ``(added, removed, preserved_times)``.
+    """
+    selected = set(selected_times)
+    # Re-read the day fresh so a booking made mid-flow is respected.
+    rows = await get_slots_on_date(session, local_date)
+    existing: dict[str, tuple[Slot, Optional[Booking]]] = {
+        format_time(slot.starts_at): (slot, booking) for slot, booking, _u in rows
+    }
+
+    # Additions: selected times that have no slot yet. Skip past datetimes.
+    now = utcnow()
+    to_create: list[datetime] = []
+    for t in sorted(selected - existing.keys()):
+        dt_utc = combine_local_to_utc(local_date, parse_local_time(t))
+        if dt_utc > now:
+            to_create.append(dt_utc)
+    added, _dup = await create_slots(
+        session, to_create, created_by=created_by, duration_min=duration_min
+    )
+
+    # Removals: deselected times. Free slots are deleted race-safely; booked
+    # slots are preserved and reported.
+    removed = 0
+    preserved: list[str] = []
+    for t in sorted(existing.keys() - selected):
+        slot, booking = existing[t]
+        if booking is None and slot.status == SlotStatus.free:
+            if await delete_free_slot(session, slot.id):
+                removed += 1
+        else:
+            preserved.append(t)
+    return added, removed, preserved
+
+
 # --- Bookings ------------------------------------------------------------
 
 async def capture_slot_and_book(
@@ -299,6 +413,23 @@ async def capture_slot_and_book(
 async def get_booking(session: AsyncSession, booking_id: int) -> Optional[Booking]:
     """Return a booking by id, or ``None``."""
     return await session.get(Booking, booking_id)
+
+
+async def get_active_booking_for_slot(
+    session: AsyncSession, slot_id: int
+) -> Optional[tuple[Booking, Optional[User]]]:
+    """Active booking (+ its booker) for a slot, or ``None`` if the slot is free.
+
+    Backs the staff «Управление записями» slot-action screen: it needs the
+    booking id (to force-free) and the booker's ФИО (to show) in one query.
+    """
+    stmt = (
+        select(Booking, User)
+        .outerjoin(User, User.tg_id == Booking.user_id)
+        .where(Booking.slot_id == slot_id, Booking.status == BookingStatus.active)
+    )
+    row = (await session.execute(stmt)).first()
+    return (row[0], row[1]) if row is not None else None
 
 
 async def get_active_bookings_for_user(
@@ -379,3 +510,35 @@ async def get_active_bookings_with_reminders_future(
         if run_at > now:
             result.append((booking, slot))
     return result
+
+
+# --- App settings (key-value) --------------------------------------------
+
+async def get_setting(session: AsyncSession, key: str) -> Optional[str]:
+    """Return the stored value for ``key``, or ``None`` if unset."""
+    setting = await session.get(AppSetting, key)
+    return setting.value if setting is not None else None
+
+
+async def set_setting(session: AsyncSession, key: str, value: str) -> None:
+    """Upsert a single app setting value."""
+    setting = await session.get(AppSetting, key)
+    if setting is None:
+        session.add(AppSetting(key=key, value=value))
+    else:
+        setting.value = value
+    await session.commit()
+
+
+# Key under which the global weekend-visibility flag is stored ("1"/"0").
+_SHOW_WEEKENDS_KEY = "show_weekends"
+
+
+async def get_show_weekends(session: AsyncSession) -> bool:
+    """Whether Sat/Sun are shown across the bot. Defaults to ``False`` (hidden)."""
+    return await get_setting(session, _SHOW_WEEKENDS_KEY) == "1"
+
+
+async def set_show_weekends(session: AsyncSession, value: bool) -> None:
+    """Persist the global weekend-visibility flag as ``"1"`` / ``"0"``."""
+    await set_setting(session, _SHOW_WEEKENDS_KEY, "1" if value else "0")

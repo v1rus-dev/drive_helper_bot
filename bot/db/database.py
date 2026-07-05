@@ -57,3 +57,22 @@ async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Legacy migration: the 'moderator' role was removed and folded into
+        # 'teacher'. A stored 'moderator' would fail to load once the enum value
+        # is gone, so rewrite any such rows to 'teacher'. Harmless (0 rows) when
+        # no legacy moderators exist.
+        await conn.exec_driver_sql(
+            "UPDATE users SET role='teacher' WHERE role='moderator'"
+        )
+
+    # Legacy migration: the 'phone' column was removed from User. An existing DB
+    # still carries a NOT NULL 'phone' column; drop it (SQLite 3.35+ supports
+    # DROP COLUMN). Run in its own transaction so a failure — the column is
+    # already gone (fresh DB) or the SQLite build is too old — cannot roll back
+    # schema creation. Idempotent: a second run simply fails the ALTER and is
+    # ignored, so no-op on a DB that never had the column.
+    try:
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql("ALTER TABLE users DROP COLUMN phone")
+    except Exception:
+        pass

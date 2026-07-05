@@ -32,7 +32,6 @@ class Base(DeclarativeBase):
 # lets the partial unique index below match a literal reliably.
 class UserRole(str, enum.Enum):
     student = "student"
-    moderator = "moderator"
     teacher = "teacher"
     admin = "admin"
 
@@ -55,7 +54,6 @@ class User(Base):
         BigInteger, primary_key=True, autoincrement=False
     )
     full_name: Mapped[str] = mapped_column(String, nullable=False)
-    phone: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[UserRole] = mapped_column(
         SAEnum(UserRole), default=UserRole.student, nullable=False
     )
@@ -119,13 +117,22 @@ class Booking(Base):
     )
 
 
+class AppSetting(Base):
+    """Tiny key-value store for singleton app settings (e.g. the slot preset)."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[str] = mapped_column(String, nullable=False)
+
+
 def effective_role(user: Optional[User], settings: Settings) -> Optional[UserRole]:
     """Effective role: env (``is_admin``) is authoritative for the admin tier.
 
     A stale stored ``admin`` role never grants admin — the DB may only grant
-    ``moderator`` (or ``student``). This makes removing an id from ADMIN_IDS
-    actually revoke admin/moderator access even before the middleware writes
-    the demotion back to the DB.
+    ``teacher`` (or ``student``). This makes removing an id from ADMIN_IDS
+    actually revoke admin access even before the middleware writes the demotion
+    back to the DB.
     """
     if user is None:
         return None
@@ -136,26 +143,14 @@ def effective_role(user: Optional[User], settings: Settings) -> Optional[UserRol
     return user.role
 
 
-def is_moderator_or_admin(user: Optional[User], settings: Settings) -> bool:
-    """Whether the user may use moderator features (moderator or admin).
+def can_manage_slots(user: Optional[User], settings: Settings) -> bool:
+    """Whether the user may create / edit slots (teacher or admin).
 
-    Teacher is intentionally excluded — a teacher cannot add slots.
+    Admin is a super-user of the teacher's slot-management capabilities.
     """
-    return effective_role(user, settings) in (UserRole.moderator, UserRole.admin)
+    return effective_role(user, settings) in (UserRole.teacher, UserRole.admin)
 
 
 def is_teacher(user: Optional[User], settings: Settings) -> bool:
     """Whether the user's effective role is teacher (env admin does not count)."""
     return effective_role(user, settings) == UserRole.teacher
-
-
-def can_view_staff_schedule(user: Optional[User], settings: Settings) -> bool:
-    """Whether the user may see the staff schedule (with student ФИО+телефон).
-
-    Grants the "see who booked" permission to moderators, teachers and admins.
-    """
-    return effective_role(user, settings) in (
-        UserRole.moderator,
-        UserRole.teacher,
-        UserRole.admin,
-    )

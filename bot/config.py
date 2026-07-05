@@ -7,6 +7,7 @@ not crash an import smoke test).
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 from pydantic import field_validator
@@ -28,6 +29,12 @@ class Settings(BaseSettings):
     tz: str = "Europe/Minsk"
     default_slot_duration_min: int = 90
     db_path: str = "/data/drivehelper.db"
+
+    # Bounds and granularity of the candidate slot start-times offered in the
+    # button-based time picker. Times are local (school-TZ) ``HH:MM`` strings.
+    slot_time_start: str = "07:00"
+    slot_time_end: str = "21:00"
+    slot_time_step_min: int = 30
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -56,6 +63,42 @@ class Settings(BaseSettings):
                     f"а не @username; некорректное значение: «{token}»"
                 ) from None
         return value
+
+    @field_validator("slot_time_start", "slot_time_end")
+    @classmethod
+    def _validate_slot_time(cls, value: str) -> str:
+        """Fail fast at startup if a slot-time bound is not ``HH:MM``."""
+        try:
+            datetime.strptime(value.strip(), "%H:%M")
+        except ValueError:
+            raise ValueError(
+                f"Время слота должно быть в формате ЧЧ:ММ, а не «{value}»"
+            ) from None
+        return value.strip()
+
+    @field_validator("slot_time_step_min")
+    @classmethod
+    def _validate_slot_step(cls, value: int) -> int:
+        """The picker step must be a positive number of minutes."""
+        if value <= 0:
+            raise ValueError("SLOT_TIME_STEP_MIN должен быть положительным числом")
+        return value
+
+    def candidate_slot_times(self) -> list[str]:
+        """Local ``HH:MM`` start-times from ``[start, end]`` inclusive by step.
+
+        Backs the button-based time picker. Validators guarantee the bounds
+        parse and the step is positive, so this never raises at runtime.
+        """
+        start = datetime.strptime(self.slot_time_start, "%H:%M")
+        end = datetime.strptime(self.slot_time_end, "%H:%M")
+        step = timedelta(minutes=self.slot_time_step_min)
+        times: list[str] = []
+        current = start
+        while current <= end:
+            times.append(current.strftime("%H:%M"))
+            current += step
+        return times
 
     @property
     def admin_id_list(self) -> list[int]:

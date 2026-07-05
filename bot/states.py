@@ -7,34 +7,19 @@ from aiogram.fsm.state import State, StatesGroup
 
 class Registration(StatesGroup):
     full_name = State()
-    phone = State()
 
 
-class AddSlots(StatesGroup):
-    date = State()
-    times = State()
+class DefaultTimes(StatesGroup):
+    # Picking the default preset in the button-based time grid.
+    picking = State()
 
 
-class AssignModerator(StatesGroup):
-    tg_id = State()
-
-
-class RemoveModerator(StatesGroup):
-    tg_id = State()
-
-
-class DaySchedule(StatesGroup):
-    date = State()
-
-
-class AssignTeacher(StatesGroup):
-    tg_id = State()
-
-
-class RemoveTeacher(StatesGroup):
-    tg_id = State()
+class SlotEditor(StatesGroup):
+    # The button-driven weekly editor. The week-view screen itself is stateless
+    # (its offset rides in callback data); ``picking`` is active only while the
+    # time grid is shown, with mode ("day"/"week"), date and offset in FSM data.
+    picking = State()
 
 
 class EditProfile(StatesGroup):
     full_name = State()
-    phone = State()

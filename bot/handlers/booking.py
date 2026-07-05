@@ -8,83 +8,108 @@ from typing import Optional
 
 from aiogram import F, Router
 from aiogram.filters import StateFilter
-from aiogram.types import CallbackQuery, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.callbacks import (
     BookingActionCB,
-    CalendarIgnoreCB,
-    CalendarNavCB,
     DateCB,
     ReminderCB,
     SlotCB,
+    WeekNavCB,
 )
-from bot.config import Settings
 from bot.db.models import User
 from bot.db.repositories import (
     get_active_bookings_for_user,
     get_booking,
-    get_free_slot_dates,
+    get_free_slots_in_range,
     get_free_slots_on_date,
+    get_show_weekends,
     get_slot,
+    has_free_slots_after,
 )
 from bot.keyboards import (
     BTN_BOOK,
     BTN_MY,
     NO_REMINDER,
     booking_actions_inline,
-    build_calendar,
     reminder_inline,
     times_inline,
+    week_booking_markup,
 )
 from bot.services.booking_service import apply_reminder, book_slot, cancel_booking
-from bot.utils import format_dt, humanize_offset
+from bot.utils import (
+    format_dt,
+    format_week_label,
+    get_week_bounds,
+    humanize_offset,
+    to_local,
+    visible_weekdays,
+)
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="booking")
 
 
-async def _calendar_params(
-    session: AsyncSession,
-) -> Optional[tuple[set[date], tuple[int, int], tuple[int, int]]]:
-    """Available dates plus the (year, month) bounds, or ``None`` when there are none.
+async def _booking_week_view(
+    session: AsyncSession, offset: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the ``(text, keyboard)`` for a week's free-day picker.
 
-    Dates are school-TZ dates; the month bounds come from the earliest / latest
-    available date so navigation can be clamped to months that actually have slots.
+    Days are the LOCAL (school-TZ) dates within the week that have at least one
+    free upcoming slot; grouping is done on ``to_local`` so a 23:00-UTC Sunday
+    slot lands on its correct local day. ``offset`` is clamped ``>= 0`` by callers.
     """
-    dates = await get_free_slot_dates(session)
-    if not dates:
-        return None
-    earliest, latest = min(dates), max(dates)
-    return dates, (earliest.year, earliest.month), (latest.year, latest.month)
-
-
-async def _send_date_picker(message: Message, session: AsyncSession) -> None:
-    """Show the inline calendar for the first month that has free slots."""
-    params = await _calendar_params(session)
-    if params is None:
-        await message.answer("Сейчас нет свободных слотов. Загляните позже.")
-        return
-    dates, min_month, max_month = params
-    year, month = min_month  # first available month
-    await message.answer(
-        "Выберите дату:",
-        reply_markup=build_calendar(year, month, dates, min_month, max_month),
+    start_utc, end_utc = get_week_bounds(offset)
+    free = await get_free_slots_in_range(session, start_utc, end_utc)
+    # Only offer visible weekdays; weekend free slots stay hidden while weekends
+    # are off (acceptable by design — see the weekend setting).
+    visible = set(visible_weekdays(await get_show_weekends(session)))
+    days = sorted(
+        {
+            d
+            for slot in free
+            if (d := to_local(slot.starts_at).date()).weekday() in visible
+        }
     )
+    label = format_week_label(start_utc, end_utc)
+    show_prev = offset > 0
+    show_next = await has_free_slots_after(session, end_utc)
+    if days:
+        text = f"Свободные дни на неделе {label}. Выберите день:"
+    else:
+        text = f"На неделе {label} свободных слотов нет."
+    return text, week_booking_markup(days, offset, show_prev, show_next, label)
 
 
-@router.message(StateFilter(None), F.text == BTN_BOOK)
-async def start_booking(message: Message, session: AsyncSession) -> None:
-    """«Записаться» — begin the booking flow."""
-    await _send_date_picker(message, session)
+@router.message(StateFilter("*"), F.text == BTN_BOOK)
+async def start_booking(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    """«Записаться» — show the current week's free days (cancels any in-progress flow)."""
+    await state.clear()
+    text, markup = await _booking_week_view(session, 0)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(WeekNavCB.filter(F.mode == "book"))
+async def navigate_booking_week(
+    callback: CallbackQuery, callback_data: WeekNavCB, session: AsyncSession
+) -> None:
+    """Re-render the free-day picker for another week (clamped to the current week)."""
+    offset = max(0, callback_data.offset)
+    text, markup = await _booking_week_view(session, offset)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
 
 
 @router.callback_query(DateCB.filter())
 async def pick_date(
     callback: CallbackQuery, callback_data: DateCB, session: AsyncSession
 ) -> None:
-    """After a date is chosen, show the available time slots."""
+    """After a day is chosen, show that day's free time slots."""
     try:
         chosen = date.fromisoformat(callback_data.value)
     except ValueError:
@@ -94,7 +119,7 @@ async def pick_date(
     slots = await get_free_slots_on_date(session, chosen)
     if not slots:
         await callback.message.edit_text(
-            "На эту дату свободных слотов не осталось. Выберите другую дату."
+            "На эту дату свободных слотов не осталось. Выберите другой день."
         )
         await callback.answer()
         return
@@ -103,33 +128,6 @@ async def pick_date(
         f"Свободное время на {chosen.strftime('%d.%m.%Y')}:",
         reply_markup=times_inline(slots),
     )
-    await callback.answer()
-
-
-@router.callback_query(CalendarNavCB.filter())
-async def navigate_calendar(
-    callback: CallbackQuery, callback_data: CalendarNavCB, session: AsyncSession
-) -> None:
-    """Re-render the calendar for the requested month, clamped to the slot range."""
-    params = await _calendar_params(session)
-    if params is None:
-        await callback.message.edit_text("Сейчас нет свободных слотов. Загляните позже.")
-        await callback.answer()
-        return
-    dates, min_month, max_month = params
-    # Clamp defensively: the arrows already hide out-of-range months, but callback
-    # data is client-supplied and the available range may shift between renders.
-    target = min(max((callback_data.year, callback_data.month), min_month), max_month)
-    year, month = target
-    await callback.message.edit_reply_markup(
-        reply_markup=build_calendar(year, month, dates, min_month, max_month)
-    )
-    await callback.answer()
-
-
-@router.callback_query(CalendarIgnoreCB.filter())
-async def ignore_calendar_tap(callback: CallbackQuery) -> None:
-    """No-op tap on a placeholder / disabled arrow / label — just clear the spinner."""
     await callback.answer()
 
 
@@ -196,11 +194,15 @@ async def choose_reminder(
     await callback.answer()
 
 
-@router.message(StateFilter(None), F.text == BTN_MY)
+@router.message(StateFilter("*"), F.text == BTN_MY)
 async def my_bookings(
-    message: Message, session: AsyncSession, user: Optional[User]
+    message: Message, state: FSMContext, session: AsyncSession, user: Optional[User]
 ) -> None:
-    """List the user's active bookings, each with cancel / reschedule actions."""
+    """List the user's active bookings, each with cancel / reschedule actions.
+
+    Cancels any in-progress flow first so the menu tap always shows the bookings.
+    """
+    await state.clear()
     if user is None:
         await message.answer("Пожалуйста, начните с команды /start")
         return
@@ -253,5 +255,6 @@ async def reschedule_action(
     # expected_user_id re-checks ownership at the data layer (defense in depth).
     await cancel_booking(session, callback_data.booking_id, expected_user_id=user.tg_id)
     await callback.message.edit_text("Прежняя запись отменена. Выберите новое время.")
-    await _send_date_picker(callback.message, session)
+    text, markup = await _booking_week_view(session, 0)
+    await callback.message.answer(text, reply_markup=markup)
     await callback.answer()

@@ -1,120 +1,118 @@
-"""Read-only schedule for students: pick a date, see all slots with status.
+"""Weekly schedule for everyone: current week, day-by-day, with booker names.
 
-This view deliberately hides *who* booked an occupied slot — it shows only the
-time and «занято». The staff day-schedule (with student ФИО+телефон) is a
-separate renderer gated by ``can_view_staff_schedule`` and is never reused here.
+Available to ALL registered users (student / teacher / admin). Free slots show
+«свободно»; booked slots reveal the booker's ФИО (a product decision by the
+owner). All names are HTML-escaped — the bot sends ``parse_mode=HTML`` bot-wide.
+The week is navigated with ‹/› buttons; ``offset`` is clamped to the current week.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import datetime
+from html import escape
 from typing import Optional
 
 from aiogram import F, Router
 from aiogram.filters import StateFilter
-from aiogram.types import CallbackQuery, Message
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.callbacks import ScheduleDateCB, ScheduleNavCB
-from bot.db.models import SlotStatus
-from bot.db.repositories import get_all_slot_dates, get_all_slots_on_date
-from bot.keyboards import BTN_SCHEDULE, build_calendar
-from bot.utils import format_time
+from bot.callbacks import WeekNavCB
+from bot.db.models import Booking, Slot, SlotStatus, User
+from bot.db.repositories import get_show_weekends, get_slots_in_range, has_slots_after
+from bot.keyboards import BTN_SCHEDULE, week_schedule_markup
+from bot.utils import (
+    format_day_full,
+    format_time,
+    format_week_label,
+    get_week_bounds,
+    to_local,
+    visible_weekdays,
+)
 
 logger = logging.getLogger(__name__)
 
 router = Router(name="schedule")
 
-_NO_SLOTS = "Слотов пока нет. Загляните позже."
+
+def render_week_schedule(
+    rows: list[tuple[Slot, Optional[Booking], Optional[User]]],
+    start_utc: datetime,
+    end_utc: datetime,
+    visible: set[int],
+) -> str:
+    """Render a week's slots grouped by LOCAL day, with booker ФИО for busy slots.
+
+    ``rows`` come ordered by ``starts_at`` (see :func:`get_slots_in_range`), so
+    per-day times stay ascending. Grouping is on ``to_local`` — a 23:00-UTC Sunday
+    slot belongs to its local day, not the naive-UTC one. Booker names are escaped
+    (the bot sends ``parse_mode=HTML``). Days with no slots are omitted.
+
+    ``visible`` is the set of ``date.weekday()`` ints allowed by the weekend
+    setting; days outside it (Sat/Sun when weekends are off) are dropped. Edge
+    note: weekend slots that exist while weekends are off stay hidden until the
+    setting is re-enabled — acceptable by design.
+    """
+    label = format_week_label(start_utc, end_utc)
+    by_day: dict = {}
+    for slot, _booking, booker in rows:
+        day = to_local(slot.starts_at).date()
+        if day.weekday() not in visible:
+            continue
+        by_day.setdefault(day, []).append((slot, booker))
+
+    if not by_day:
+        return f"<b>Расписание {label}</b>\n\nНа этой неделе слотов нет."
+
+    lines = [f"<b>Расписание {label}</b>", ""]
+    for day in sorted(by_day):
+        lines.append(f"<b>{format_day_full(day)}</b>")
+        for slot, booker in by_day[day]:
+            t = format_time(slot.starts_at)
+            if slot.status == SlotStatus.booked and booker is not None:
+                lines.append(f"{t} — занято: {escape(booker.full_name)}")
+            elif slot.status == SlotStatus.booked:
+                lines.append(f"{t} — занято")
+            else:
+                lines.append(f"{t} — свободно")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
-async def _calendar_params(
-    session: AsyncSession,
-) -> Optional[tuple[set[date], tuple[int, int], tuple[int, int]]]:
-    """Dates that have *any* slot plus the (year, month) bounds, or ``None``."""
-    dates = await get_all_slot_dates(session)
-    if not dates:
-        return None
-    earliest, latest = min(dates), max(dates)
-    return dates, (earliest.year, earliest.month), (latest.year, latest.month)
-
-
-def _calendar_markup(
-    dates: set[date], min_month: tuple[int, int], max_month: tuple[int, int]
-):
-    year, month = min_month  # first month that has a slot
-    return build_calendar(
-        year,
-        month,
-        dates,
-        min_month,
-        max_month,
-        date_cb=ScheduleDateCB,
-        nav_cb=ScheduleNavCB,
+async def _week_view(
+    session: AsyncSession, offset: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the ``(text, keyboard)`` for the schedule of the week at ``offset``."""
+    start_utc, end_utc = get_week_bounds(offset)
+    rows = await get_slots_in_range(session, start_utc, end_utc)
+    visible = set(visible_weekdays(await get_show_weekends(session)))
+    text = render_week_schedule(rows, start_utc, end_utc, visible)
+    show_prev = offset > 0
+    show_next = await has_slots_after(session, end_utc)
+    markup = week_schedule_markup(
+        offset, show_prev, show_next, format_week_label(start_utc, end_utc)
     )
+    return text, markup
 
 
-@router.message(StateFilter(None), F.text == BTN_SCHEDULE)
-async def show_schedule(message: Message, session: AsyncSession) -> None:
-    """«Расписание» — open the read-only date picker over all days with slots."""
-    params = await _calendar_params(session)
-    if params is None:
-        await message.answer(_NO_SLOTS)
-        return
-    await message.answer("Выберите дату:", reply_markup=_calendar_markup(*params))
+@router.message(StateFilter("*"), F.text == BTN_SCHEDULE)
+async def show_schedule(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    """«Расписание» — render the current week (cancels any in-progress flow)."""
+    await state.clear()
+    text, markup = await _week_view(session, 0)
+    await message.answer(text, reply_markup=markup)
 
 
-@router.callback_query(ScheduleNavCB.filter())
+@router.callback_query(WeekNavCB.filter(F.mode == "schedule"))
 async def navigate_schedule(
-    callback: CallbackQuery, callback_data: ScheduleNavCB, session: AsyncSession
+    callback: CallbackQuery, callback_data: WeekNavCB, session: AsyncSession
 ) -> None:
-    """Re-render the schedule calendar for the requested month, clamped to range."""
-    params = await _calendar_params(session)
-    if params is None:
-        await callback.message.edit_text(_NO_SLOTS)
-        await callback.answer()
-        return
-    dates, min_month, max_month = params
-    # Clamp defensively: callback data is client-supplied and the range may shift.
-    target = min(max((callback_data.year, callback_data.month), min_month), max_month)
-    year, month = target
-    await callback.message.edit_reply_markup(
-        reply_markup=build_calendar(
-            year,
-            month,
-            dates,
-            min_month,
-            max_month,
-            date_cb=ScheduleDateCB,
-            nav_cb=ScheduleNavCB,
-        )
-    )
-    await callback.answer()
-
-
-@router.callback_query(ScheduleDateCB.filter())
-async def show_day(
-    callback: CallbackQuery, callback_data: ScheduleDateCB, session: AsyncSession
-) -> None:
-    """List every slot on the chosen day with status only (no student PII)."""
-    try:
-        chosen = date.fromisoformat(callback_data.value)
-    except ValueError:
-        await callback.answer("Некорректная дата", show_alert=True)
-        return
-
-    slots = await get_all_slots_on_date(session, chosen)
-    if not slots:
-        await callback.message.edit_text(
-            "На эту дату слотов нет. Выберите другую дату."
-        )
-        await callback.answer()
-        return
-
-    lines = [f"<b>Расписание на {chosen.strftime('%d.%m.%Y')}:</b>", ""]
-    for slot in slots:
-        status = "🟢 свободно" if slot.status == SlotStatus.free else "🔴 занято"
-        lines.append(f"{format_time(slot.starts_at)} — {status}")
-    await callback.message.edit_text("\n".join(lines))
+    """Re-render the schedule for another week (clamped to the current week)."""
+    offset = max(0, callback_data.offset)
+    text, markup = await _week_view(session, offset)
+    await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()

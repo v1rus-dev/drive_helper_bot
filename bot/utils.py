@@ -9,7 +9,7 @@ datetimes are never accidentally mixed.
 from __future__ import annotations
 
 import unicodedata
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -18,8 +18,11 @@ from bot.config import get_settings
 # Upper bound on a stored full name (registration + profile editing share it).
 MAX_NAME_LEN = 100
 
-# Upper bound on a stored phone (registration + profile editing share it).
-MAX_PHONE_LEN = 32
+# Russian weekday names indexed by ``date.weekday()`` (Monday == 0).
+RU_WEEKDAYS_FULL: tuple[str, ...] = (
+    "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
+)
+RU_WEEKDAYS_SHORT: tuple[str, ...] = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 
 def _tz() -> ZoneInfo:
@@ -82,6 +85,55 @@ def combine_local_to_utc(local_date: date, local_time: time) -> datetime:
     return local_to_utc(datetime.combine(local_date, local_time))
 
 
+def get_week_bounds(offset: int) -> tuple[datetime, datetime]:
+    """Return the ``[start, end)`` naive-UTC bounds of an ISO week.
+
+    Weeks are Monday 00:00 .. next Monday 00:00 computed in the *school* time
+    zone, then converted to UTC for querying naive-UTC slot ``starts_at`` values.
+    ``offset`` counts weeks from the current one (0 = current week, 1 = next, …);
+    a slot at 23:00 UTC Sunday may be Monday next week locally, so the boundary
+    must be taken on the local Monday, never on the naive-UTC value.
+    """
+    today_local = to_local(utcnow()).date()
+    # weekday(): Monday == 0, so subtracting it lands on this week's Monday.
+    monday = today_local - timedelta(days=today_local.weekday()) + timedelta(weeks=offset)
+    start_local = datetime.combine(monday, time.min)
+    start_utc = local_to_utc(start_local)
+    end_utc = local_to_utc(start_local + timedelta(days=7))
+    return start_utc, end_utc
+
+
+def format_week_label(start_utc: datetime, end_utc: datetime) -> str:
+    """Human label for a week, e.g. ``15.07–21.07`` (Monday .. Sunday, local).
+
+    ``end_utc`` is the exclusive next-Monday boundary, so the displayed last day
+    is ``end_utc`` minus one day in local time.
+    """
+    start_local = to_local(start_utc).date()
+    last_local = to_local(end_utc).date() - timedelta(days=1)
+    return f"{start_local.strftime('%d.%m')}–{last_local.strftime('%d.%m')}"
+
+
+def format_day_full(local_date: date) -> str:
+    """Localized day header, e.g. ``Понедельник, 15.07``."""
+    return f"{RU_WEEKDAYS_FULL[local_date.weekday()]}, {local_date.strftime('%d.%m')}"
+
+
+def format_day_short(local_date: date) -> str:
+    """Localized short day label for buttons, e.g. ``Пн 15.07``."""
+    return f"{RU_WEEKDAYS_SHORT[local_date.weekday()]} {local_date.strftime('%d.%m')}"
+
+
+def visible_weekdays(show_weekends: bool) -> list[int]:
+    """Python ``date.weekday()`` ints that are visible under the weekend setting.
+
+    ``[0..4]`` (Mon–Fri) when weekends are hidden, ``[0..6]`` (Mon–Sun) when
+    shown. Used everywhere a week's days are enumerated (slot editor, booking,
+    schedule) so a single toggle governs weekend visibility across the bot.
+    """
+    return list(range(7)) if show_weekends else list(range(5))
+
+
 def clean_full_name(raw: Optional[str]) -> Optional[str]:
     """Sanitize a user-entered full name for storage and HTML display.
 
@@ -95,26 +147,6 @@ def clean_full_name(raw: Optional[str]) -> Optional[str]:
     cleaned = "".join(ch for ch in raw if not unicodedata.category(ch).startswith("C"))
     cleaned = cleaned.strip()
     if not cleaned or len(cleaned) > MAX_NAME_LEN:
-        return None
-    return cleaned
-
-
-def normalize_phone(contact_phone: Optional[str], text: Optional[str]) -> Optional[str]:
-    """Pick a phone number from a shared contact or typed text (registration parity).
-
-    Prefers the contact's number; falls back to typed text. Strips Unicode
-    control characters (they can break the HTML-parse-mode messages the bot
-    sends and enable bidi phone spoofing in the staff schedule) and trims
-    whitespace, mirroring :func:`clean_full_name`. Returns ``None`` when the
-    result is empty or longer than ``MAX_PHONE_LEN`` (callers treat that as
-    invalid input and re-prompt). Format is not validated otherwise — matches
-    the existing registration behaviour (free-form text is accepted as-is).
-    """
-    raw = contact_phone or text or ""
-    # Drop control chars (Unicode category "C*"); keep ordinary spaces.
-    cleaned = "".join(ch for ch in raw if not unicodedata.category(ch).startswith("C"))
-    cleaned = cleaned.strip()
-    if not cleaned or len(cleaned) > MAX_PHONE_LEN:
         return None
     return cleaned
 
