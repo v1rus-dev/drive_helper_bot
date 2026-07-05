@@ -92,6 +92,17 @@ class SetWeekCB(CallbackData, prefix="setwk"):
     offset: int
 
 
+class SlotOverrideConfirmCB(CallbackData, prefix="ovcfm"):
+    """Teacher confirms/aborts a slot-editor override that would cancel bookings.
+
+    ``action`` is ``"confirm"`` / ``"cancel"``. Callback-driven only (no text
+    input), so it needs no MENU_TEXTS guard; ``can_manage_slots`` is re-checked
+    server-side on both actions. The pending selection + context ride in FSM data.
+    """
+
+    action: str
+
+
 class SettingsCB(CallbackData, prefix="setg"):
     """Teacher/admin settings action. ``action`` is ``"toggle_weekends"``."""
 
@@ -147,12 +158,42 @@ class ManageBookCB(CallbackData, prefix="mbook"):
     offset: int
 
 
-class UserSelectCB(CallbackData, prefix="usel"):
-    """Admin picks a user from an inline list to change their role.
+class UsersListCB(CallbackData, prefix="ulist"):
+    """Admin «Пользователи»: re-render the full user list (no payload).
 
-    ``action`` is ``assign`` / ``remove``. ``tg_id`` is server-re-checked and is
-    never shown to or typed by users — it only rides in admin-only callback data.
+    Used by the «‹ Назад к списку» button. Admin-only + server-re-checked.
     """
 
-    action: str
+
+class UserCardCB(CallbackData, prefix="ucard"):
+    """Admin «Пользователи»: open one user's card.
+
+    ``tg_id`` is server-re-checked on every use and is never shown to or typed
+    by users — it only rides in admin-only callback data.
+    """
+
+    tg_id: int
+
+
+class UserRoleCB(CallbackData, prefix="urole"):
+    """Admin «Пользователи»: set a target user's role from their card.
+
+    ``role`` is the target stored role (``teacher`` / ``student``); an env-admin
+    is never a valid target (re-checked server-side). ``tg_id`` rides only in
+    admin-only, server-re-checked callback data.
+    """
+
+    tg_id: int
+    role: str
+
+
+class UserDeleteCB(CallbackData, prefix="udel"):
+    """Admin «Пользователи»: request deletion of a user (shows confirmation)."""
+
+    tg_id: int
+
+
+class UserDeleteConfirmCB(CallbackData, prefix="udelc"):
+    """Admin «Пользователи»: confirm deletion of a user (irreversible)."""
+
     tg_id: int

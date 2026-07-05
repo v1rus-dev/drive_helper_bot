@@ -19,6 +19,9 @@ class SlotEditor(StatesGroup):
     # (its offset rides in callback data); ``picking`` is active only while the
     # time grid is shown, with mode ("day"/"week"), date and offset in FSM data.
     picking = State()
+    # Awaiting confirmation of an override that would cancel one or more bookings.
+    # The pending selection + context (mode/date/offset/selected) stay in FSM data.
+    confirming = State()
 
 
 class EditProfile(StatesGroup):

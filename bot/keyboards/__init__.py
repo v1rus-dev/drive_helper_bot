@@ -27,9 +27,14 @@ from bot.callbacks import (
     SetWeekCB,
     SlotCB,
     SlotManageCB,
+    SlotOverrideConfirmCB,
     TimeCtrlCB,
     TimeToggleCB,
-    UserSelectCB,
+    UserCardCB,
+    UserDeleteCB,
+    UserDeleteConfirmCB,
+    UserRoleCB,
+    UsersListCB,
     WeekNavCB,
 )
 from bot.db.models import Booking, Slot, SlotStatus, User, UserRole
@@ -45,8 +50,7 @@ BTN_MANAGE_SCHEDULE = "Ведение расписания"
 BTN_MANAGE_BOOKINGS = "Управление записями"
 BTN_DEFAULT_TIMES = "Времена по умолчанию"
 BTN_SETTINGS = "Настройки"
-BTN_ASSIGN_TEACHER = "Назначить преподавателя"
-BTN_REMOVE_TEACHER = "Снять преподавателя"
+BTN_USERS = "Пользователи"
 BTN_EDIT_NAME = "Изменить ФИО"
 
 # Every reply-keyboard label that appears in ANY role's main menu (see
@@ -67,8 +71,7 @@ MENU_TEXTS: frozenset[str] = frozenset(
         BTN_MANAGE_BOOKINGS,
         BTN_DEFAULT_TIMES,
         BTN_SETTINGS,
-        BTN_ASSIGN_TEACHER,
-        BTN_REMOVE_TEACHER,
+        BTN_USERS,
     }
 )
 
@@ -116,18 +119,15 @@ def main_menu(role: UserRole = UserRole.student) -> ReplyKeyboardMarkup:
     """Build the main reply keyboard tailored to the user's effective role.
 
     Student — book / my bookings / schedule; teacher — slot management + the
-    weekly schedule; admin — the teacher menu plus teacher role management.
-    «Расписание», «Мой профиль» и «Помощь» показываются всем.
+    weekly schedule; admin — the teacher menu plus the unified «Пользователи»
+    management menu. «Расписание», «Мой профиль» и «Помощь» показываются всем.
     """
     builder = ReplyKeyboardBuilder()
     if role == UserRole.teacher:
         _staff_slot_rows(builder)
     elif role == UserRole.admin:
         _staff_slot_rows(builder)
-        builder.row(
-            KeyboardButton(text=BTN_ASSIGN_TEACHER),
-            KeyboardButton(text=BTN_REMOVE_TEACHER),
-        )
+        builder.row(KeyboardButton(text=BTN_USERS))
     else:  # student (and any unknown role) — booking-facing menu
         builder.row(KeyboardButton(text=BTN_BOOK))
         builder.row(KeyboardButton(text=BTN_MY), KeyboardButton(text=BTN_SCHEDULE))
@@ -236,9 +236,9 @@ def week_editor_markup(
 def _slot_manage_label(slot: Slot, booker: Optional[User]) -> str:
     """Button label for one slot in the manage day view, e.g. «10:30 · занято: Иванов».
 
-    Button labels are NOT HTML-parsed by Telegram (like ``users_inline``), so no
-    escaping is applied here; the booker's ФИО is escaped wherever it appears in
-    a message. Long names are truncated so the button stays within the limit.
+    Button labels are NOT HTML-parsed by Telegram (like the user-list buttons),
+    so no escaping is applied here; the booker's ФИО is escaped wherever it
+    appears in a message. Long names are truncated so the button stays in-limit.
     """
     t = format_time(slot.starts_at)
     if slot.status == SlotStatus.booked and booker is not None:
@@ -345,6 +345,26 @@ def manage_users_markup(
     return builder.as_markup()
 
 
+def override_confirm_markup() -> InlineKeyboardMarkup:
+    """Confirmation keyboard for an override that will cancel bookings.
+
+    «Подтвердить отмену» applies the pending override (incl. cancellations);
+    «Отмена» discards it and returns to the editor. Both carry a
+    :class:`SlotOverrideConfirmCB`; the pending selection rides in FSM data.
+    """
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Подтвердить отмену",
+        callback_data=SlotOverrideConfirmCB(action="confirm"),
+    )
+    builder.button(
+        text="Отмена",
+        callback_data=SlotOverrideConfirmCB(action="cancel"),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def settings_inline(show_weekends: bool) -> InlineKeyboardMarkup:
     """Inline toggle for the weekend-visibility setting.
 
@@ -423,20 +443,60 @@ def time_grid(candidate_times: list[str], selected: set[str]) -> InlineKeyboardM
     return builder.as_markup()
 
 
-def users_inline(users: Iterable[User], action: str) -> InlineKeyboardMarkup:
-    """Inline list of users (labeled by ФИО) for admin role selection.
+def users_list_markup(entries: Iterable[tuple[int, str]]) -> InlineKeyboardMarkup:
+    """Inline list of users for the admin «Пользователи» menu.
 
-    Button text is plain (Telegram does not HTML-parse button labels, so no
-    escaping is applied here — names are escaped where they appear in messages).
-    Long names are truncated so the button stays within Telegram's limit.
+    ``entries`` are ``(tg_id, label)`` pairs; the caller builds each label as
+    «ФИО — роль» (already truncated). Button text is PLAIN — Telegram does not
+    HTML-parse button labels, so names are NOT escaped here (they are escaped
+    where they appear in message text). Each button carries a :class:`UserCardCB`
+    with the admin-only, server-re-checked ``tg_id``.
     """
     builder = InlineKeyboardBuilder()
-    for user in users:
-        label = user.full_name if len(user.full_name) <= 60 else user.full_name[:57] + "…"
+    for tg_id, label in entries:
+        builder.button(text=label, callback_data=UserCardCB(tg_id=tg_id))
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def user_card_markup(
+    tg_id: int, role: UserRole, is_env_admin: bool
+) -> InlineKeyboardMarkup:
+    """Action buttons for one user's card, tailored to their effective role.
+
+    An env-admin (``is_env_admin``) gets NO role/delete buttons — only «Назад»
+    (admin is env-authoritative; role is managed via ADMIN_IDS and the user is
+    never deletable). A student can be promoted to teacher, a teacher demoted to
+    student; both non-admin roles can be deleted.
+    """
+    builder = InlineKeyboardBuilder()
+    if not is_env_admin:
+        if role == UserRole.student:
+            builder.button(
+                text="Назначить преподавателем",
+                callback_data=UserRoleCB(tg_id=tg_id, role=UserRole.teacher.value),
+            )
+        elif role == UserRole.teacher:
+            builder.button(
+                text="Снять преподавателя",
+                callback_data=UserRoleCB(tg_id=tg_id, role=UserRole.student.value),
+            )
         builder.button(
-            text=label,
-            callback_data=UserSelectCB(action=action, tg_id=user.tg_id),
+            text="🗑 Удалить пользователя",
+            callback_data=UserDeleteCB(tg_id=tg_id),
         )
+    builder.button(text="‹ Назад к списку", callback_data=UsersListCB())
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def user_delete_confirm_markup(tg_id: int) -> InlineKeyboardMarkup:
+    """Confirmation keyboard for deleting a user: «Удалить» / «Отмена» (to card)."""
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Удалить", callback_data=UserDeleteConfirmCB(tg_id=tg_id)
+    )
+    builder.button(text="Отмена", callback_data=UserCardCB(tg_id=tg_id))
     builder.adjust(1)
     return builder.as_markup()
 
@@ -451,8 +511,7 @@ __all__ = [
     "BTN_MANAGE_BOOKINGS",
     "BTN_DEFAULT_TIMES",
     "BTN_SETTINGS",
-    "BTN_ASSIGN_TEACHER",
-    "BTN_REMOVE_TEACHER",
+    "BTN_USERS",
     "BTN_EDIT_NAME",
     "MENU_TEXTS",
     "ROLE_LABELS",
@@ -467,11 +526,14 @@ __all__ = [
     "manage_day_markup",
     "force_free_confirm_markup",
     "manage_users_markup",
+    "override_confirm_markup",
     "settings_inline",
     "times_inline",
     "reminder_inline",
     "booking_actions_inline",
     "time_grid",
-    "users_inline",
+    "users_list_markup",
+    "user_card_markup",
+    "user_delete_confirm_markup",
     "format_date",
 ]

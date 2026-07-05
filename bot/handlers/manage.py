@@ -47,6 +47,7 @@ from bot.db.repositories import (
     get_slot,
     get_slots_in_range,
     get_slots_on_date,
+    get_user,
 )
 from bot.keyboards import (
     BTN_MANAGE_BOOKINGS,
@@ -55,7 +56,7 @@ from bot.keyboards import (
     manage_users_markup,
     manage_week_markup,
 )
-from bot.services.booking_service import cancel_booking
+from bot.services.booking_service import broadcast_cancellation, cancel_booking
 from bot.utils import (
     format_day_short,
     format_dt,
@@ -300,6 +301,10 @@ async def manage_force_free(
         return
 
     target_tg_id = booking.user_id
+    # Capture the booked student's ФИО BEFORE cancelling (for the broadcast). The
+    # user row is untouched by the cancel, but load it while we hold the booking.
+    booked_user = await get_user(session, target_tg_id)
+    booked_name = booked_user.full_name if booked_user is not None else "ученик"
     # STAFF cancel: no expected_user_id -> cancels regardless of owner, frees the
     # slot and removes the reminder job. DB is committed inside the service.
     await cancel_booking(session, callback_data.booking_id)
@@ -320,6 +325,20 @@ async def manage_force_free(
     else:
         text, markup = await _week_view(session, offset)
     await callback.message.edit_text(text, reply_markup=markup)
+
+    # IN ADDITION to the direct notice above: broadcast to every OTHER registered
+    # user that the slot is free again. Best-effort, non-blocking. Excluded: the
+    # staff actor (they performed the action) AND the affected student (already
+    # notified directly above — the third-person broadcast would be redundant).
+    if slot is not None:
+        await broadcast_cancellation(
+            callback.bot,
+            session,
+            actor_is_staff=True,
+            booked_name=booked_name,
+            slot_dt=slot.starts_at,
+            exclude_tg_ids={callback.from_user.id, target_tg_id},
+        )
 
 
 @router.callback_query(ManageBookCB.filter())

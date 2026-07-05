@@ -22,7 +22,7 @@ from bot.db.models import (
     User,
     UserRole,
 )
-from bot.utils import combine_local_to_utc, format_time, local_to_utc, parse_local_time, utcnow
+from bot.utils import local_to_utc, utcnow
 
 
 # --- Users ---------------------------------------------------------------
@@ -89,6 +89,70 @@ async def update_user_name(
     await session.commit()
     await session.refresh(user)
     return user
+
+
+async def delete_user(
+    session: AsyncSession, tg_id: int, reassign_to: int
+) -> list[int]:
+    """Delete a user, cascading safely, in ONE transaction.
+
+    ``reassign_to`` is the acting admin's tg_id: slots the deleted user created
+    are reassigned to them instead of being NULL-ed. This keeps ``created_by``
+    a valid non-null FK, so the live production DB (whose ``slots.created_by`` is
+    ``NOT NULL``) needs no schema migration — ``create_all`` cannot ALTER it.
+
+    Returns the ids of the user's ACTIVE bookings so the caller can drop their
+    reminder jobs AFTER commit (the scheduler is never touched from here).
+
+    Order is chosen to keep ``PRAGMA foreign_keys=ON`` satisfied and to leave no
+    orphaned occupied slot behind:
+
+    1. Free every slot the user holds via an ACTIVE booking (so it is bookable
+       again) and collect those booking ids.
+    2. Delete ALL of the user's booking rows (active + cancelled) — required
+       before the user row can go, since ``bookings.user_id`` FKs ``users.tg_id``.
+    3. Reassign ``slots.created_by`` to ``reassign_to`` for slots this user
+       created (keep the slots; hand them to the acting admin — a valid non-null
+       FK).
+    4. Delete the user row.
+
+    Steps 1–2 guarantee no slot stays ``booked`` with a deleted booker, and
+    steps 2–3 clear both FKs into ``users`` before step 4, so the delete never
+    violates a foreign key.
+    """
+    active = (
+        await session.execute(
+            select(Booking).where(
+                Booking.user_id == tg_id,
+                Booking.status == BookingStatus.active,
+            )
+        )
+    ).scalars().all()
+    active_booking_ids = [b.id for b in active]
+
+    # 1. Free the slots held by the user's active bookings.
+    for booking in active:
+        await session.execute(
+            update(Slot)
+            .where(Slot.id == booking.slot_id)
+            .values(status=SlotStatus.free)
+        )
+
+    # 2. Remove every booking row for this user (satisfies the FK below).
+    await session.execute(delete(Booking).where(Booking.user_id == tg_id))
+
+    # 3. Reassign slots this user created to the acting admin. Using a real
+    # tg_id (not NULL) keeps the NOT NULL created_by FK valid on the live DB,
+    # so no schema migration is needed.
+    await session.execute(
+        update(Slot).where(Slot.created_by == tg_id).values(created_by=reassign_to)
+    )
+
+    # 4. Delete the user.
+    await session.execute(delete(User).where(User.tg_id == tg_id))
+
+    await session.commit()
+    return active_booking_ids
 
 
 # --- Slots ---------------------------------------------------------------
@@ -311,61 +375,11 @@ async def delete_free_slot(session: AsyncSession, slot_id: int) -> bool:
     return False
 
 
-async def apply_day_override(
-    session: AsyncSession,
-    local_date: date,
-    selected_times: Sequence[str],
-    created_by: int,
-    duration_min: int,
-) -> tuple[int, int, list[str]]:
-    """Make a local day's slots match ``selected_times`` exactly (override).
-
-    Shared by both the per-day edit and the set-whole-week flows. Behaviour:
-
-    * newly-selected times with no slot yet are created as FREE slots — times
-      already in the past are skipped (never create dead, unbookable slots) and
-      duplicates are skipped by :func:`create_slots`;
-    * previously-existing times that were DESELECTED are removed, but only when
-      the slot is genuinely free — the delete goes through the race-safe
-      :func:`delete_free_slot`, so a booked slot (or one booked concurrently in
-      the await window) is NEVER destroyed;
-    * booked slots whose time was deselected are PRESERVED and their ``HH:MM``
-      returned so the caller can warn the teacher.
-
-    ``created_by`` / ``duration_min`` are threaded through for the created slots
-    (a valid ``users.tg_id`` and the configured slot length). Returns
-    ``(added, removed, preserved_times)``.
-    """
-    selected = set(selected_times)
-    # Re-read the day fresh so a booking made mid-flow is respected.
-    rows = await get_slots_on_date(session, local_date)
-    existing: dict[str, tuple[Slot, Optional[Booking]]] = {
-        format_time(slot.starts_at): (slot, booking) for slot, booking, _u in rows
-    }
-
-    # Additions: selected times that have no slot yet. Skip past datetimes.
-    now = utcnow()
-    to_create: list[datetime] = []
-    for t in sorted(selected - existing.keys()):
-        dt_utc = combine_local_to_utc(local_date, parse_local_time(t))
-        if dt_utc > now:
-            to_create.append(dt_utc)
-    added, _dup = await create_slots(
-        session, to_create, created_by=created_by, duration_min=duration_min
-    )
-
-    # Removals: deselected times. Free slots are deleted race-safely; booked
-    # slots are preserved and reported.
-    removed = 0
-    preserved: list[str] = []
-    for t in sorted(existing.keys() - selected):
-        slot, booking = existing[t]
-        if booking is None and slot.status == SlotStatus.free:
-            if await delete_free_slot(session, slot.id):
-                removed += 1
-        else:
-            preserved.append(t)
-    return added, removed, preserved
+# NOTE: the day/week slot override (create free slots, delete deselected free
+# slots, and CANCEL bookings on deselected booked slots) lives in
+# ``bot.services.booking_service`` — it orchestrates repo writes AND the staff
+# cancel path (which drops reminder jobs), so it belongs in the service layer,
+# not here.
 
 
 # --- Bookings ------------------------------------------------------------

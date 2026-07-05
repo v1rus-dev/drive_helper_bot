@@ -19,7 +19,7 @@ from bot.callbacks import (
     SlotCB,
     WeekNavCB,
 )
-from bot.db.models import User
+from bot.db.models import BookingStatus, User
 from bot.db.repositories import (
     get_active_bookings_for_user,
     get_booking,
@@ -38,7 +38,12 @@ from bot.keyboards import (
     times_inline,
     week_booking_markup,
 )
-from bot.services.booking_service import apply_reminder, book_slot, cancel_booking
+from bot.services.booking_service import (
+    apply_reminder,
+    book_slot,
+    broadcast_cancellation,
+    cancel_booking,
+)
 from bot.utils import (
     format_dt,
     format_week_label,
@@ -233,10 +238,28 @@ async def cancel_action(
     if booking is None or user is None or booking.user_id != user.tg_id:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    # Capture the freed slot's start and whether this is a real transition BEFORE
+    # cancelling — the slot row survives (only its status flips to free) so its
+    # starts_at is still available; the actor is the booked user themself.
+    was_active = booking.status == BookingStatus.active
+    slot = await get_slot(session, booking.slot_id)
     # expected_user_id re-checks ownership at the data layer (defense in depth).
     await cancel_booking(session, callback_data.booking_id, expected_user_id=user.tg_id)
     await callback.message.edit_text("Запись отменена.")
     await callback.answer()
+
+    # Best-effort, non-blocking broadcast AFTER the commit + the actor's own
+    # confirmation: tell every OTHER registered user the slot is free again.
+    # Guarded on was_active so a double-tap (already-cancelled) sends nothing.
+    if was_active and slot is not None:
+        await broadcast_cancellation(
+            callback.bot,
+            session,
+            actor_is_staff=False,
+            booked_name=user.full_name,
+            slot_dt=slot.starts_at,
+            exclude_tg_ids={user.tg_id},
+        )
 
 
 @router.callback_query(BookingActionCB.filter(F.action == "resched"))

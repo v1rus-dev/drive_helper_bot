@@ -2,10 +2,12 @@
 
 Slot management is fully button-driven now: a weekly editor («Ведение
 расписания») renders a week, offers a per-day time grid and a
-"set-whole-week" grid, and applies each edit as a day *override* that preserves
-booked slots. A default-times preset («Времена по умолчанию») and a global
-weekend-visibility toggle («Настройки») round it out. There is no text date
-entry anywhere.
+"set-whole-week" grid, and applies each edit as a day *override*. Removing a
+time that has an ACTIVE booking now CANCELS that booking (frees + removes the
+slot, drops its reminder, notifies the student directly) — but only after an
+explicit confirmation step listing the affected bookings. A default-times preset
+(«Времена по умолчанию») and a global weekend-visibility toggle («Настройки»)
+round it out. There is no text date entry anywhere.
 
 Every entry point *and* every continuation step re-checks :func:`can_manage_slots`
 server-side, so a role change mid-flow cannot be bypassed through a stale FSM.
@@ -30,6 +32,7 @@ from bot.callbacks import (
     EditDayCB,
     SettingsCB,
     SetWeekCB,
+    SlotOverrideConfirmCB,
     TimeCtrlCB,
     TimeToggleCB,
     WeekNavCB,
@@ -37,7 +40,6 @@ from bot.callbacks import (
 from bot.config import Settings, get_settings
 from bot.db.models import SlotStatus, User, can_manage_slots
 from bot.db.repositories import (
-    apply_day_override,
     get_setting,
     get_show_weekends,
     get_slots_in_range,
@@ -50,13 +52,20 @@ from bot.keyboards import (
     BTN_DEFAULT_TIMES,
     BTN_MANAGE_SCHEDULE,
     BTN_SETTINGS,
+    override_confirm_markup,
     settings_inline,
     time_grid,
     week_editor_markup,
 )
+from bot.services.booking_service import (
+    SlotCancellation,
+    apply_day_override,
+    compute_day_override,
+)
 from bot.states import DefaultTimes, SlotEditor
 from bot.utils import (
     format_day_short,
+    format_dt,
     format_time,
     format_week_label,
     get_week_bounds,
@@ -408,6 +417,120 @@ async def editor_set_week(
     await callback.answer()
 
 
+# Cap on the number of bookings listed in the confirmation before collapsing the
+# rest into «…и ещё N», so a huge week override never overflows the message.
+_CONFIRM_LIST_CAP = 15
+
+
+def _pending_offset(data: dict) -> int:
+    """Clamped editor week offset from the pending FSM data."""
+    return max(0, min(int(data.get("offset", 0)), _EDITOR_MAX_OFFSET))
+
+
+async def _visible_week_days(
+    session: AsyncSession, offset: int
+) -> list[date_cls]:
+    """Local dates of the target week's VISIBLE weekdays (weekend setting applied)."""
+    visible = set(visible_weekdays(await get_show_weekends(session)))
+    start_utc, _end = get_week_bounds(offset)
+    monday = to_local(start_utc).date()
+    return [
+        monday + timedelta(days=i)
+        for i in range(7)
+        if (monday + timedelta(days=i)).weekday() in visible
+    ]
+
+
+async def _pending_cancellations(
+    session: AsyncSession, data: dict
+) -> list[SlotCancellation]:
+    """Dry-run: which ACTIVE bookings the pending selection would cancel.
+
+    Aggregated across all visible days for the whole-week mode. Read-only — used
+    to decide whether a confirmation is needed and to render its list.
+    """
+    selected = sorted(set(data.get("selected", [])))
+    cancellations: list[SlotCancellation] = []
+    if data.get("mode", "day") == "week":
+        for d in await _visible_week_days(session, _pending_offset(data)):
+            diff = await compute_day_override(session, d, selected)
+            cancellations.extend(diff.to_cancel)
+    else:
+        d = date_cls.fromisoformat(data["date"])
+        diff = await compute_day_override(session, d, selected)
+        cancellations.extend(diff.to_cancel)
+    return cancellations
+
+
+async def _run_override(
+    session: AsyncSession, data: dict, actor_id: int, duration: int
+) -> tuple[int, int, list[SlotCancellation]]:
+    """Apply the pending override (day or whole-week). Returns aggregated
+    ``(added, removed, cancelled)``; the caller notifies students after commit."""
+    selected = sorted(set(data.get("selected", [])))
+    if data.get("mode", "day") == "week":
+        total_added = total_removed = 0
+        cancelled: list[SlotCancellation] = []
+        for d in await _visible_week_days(session, _pending_offset(data)):
+            res = await apply_day_override(session, d, selected, actor_id, duration)
+            total_added += res.added
+            total_removed += res.removed
+            cancelled.extend(res.cancelled)
+        return total_added, total_removed, cancelled
+    d = date_cls.fromisoformat(data["date"])
+    res = await apply_day_override(session, d, selected, actor_id, duration)
+    return res.added, res.removed, list(res.cancelled)
+
+
+def _override_summary(data: dict, added: int, removed: int, cancelled: int) -> str:
+    """Human summary of an applied override, tailored to day / week mode."""
+    if data.get("mode", "day") == "week":
+        summary = f"Задано на всю неделю: добавлено {added}, удалено {removed}"
+    else:
+        local_date = date_cls.fromisoformat(data["date"])
+        summary = f"{format_day_short(local_date)}: добавлено {added}, удалено {removed}"
+    if cancelled:
+        summary += f", отменено броней {cancelled} (ученики уведомлены)"
+    return summary + "."
+
+
+def _confirm_text(mode: str, cancellations: list[SlotCancellation]) -> str:
+    """Confirmation body listing the bookings that would be cancelled.
+
+    Day mode lists ``HH:MM``; week mode lists the full ``DD.MM.YYYY HH:MM`` so the
+    teacher sees which day each falls on. Names are HTML-escaped (parse_mode=HTML).
+    Capped at ``_CONFIRM_LIST_CAP`` with a «…и ещё N» tail.
+    """
+    lines = ["Будут отменены брони:"]
+    shown = cancellations[:_CONFIRM_LIST_CAP]
+    for c in shown:
+        when = format_time(c.slot_starts_at) if mode == "day" else format_dt(c.slot_starts_at)
+        lines.append(f"• {when} — {escape(c.full_name)}")
+    extra = len(cancellations) - len(shown)
+    if extra > 0:
+        lines.append(f"…и ещё {extra}")
+    return "\n".join(lines)
+
+
+async def _notify_cancelled(bot, cancellations: list[SlotCancellation]) -> None:
+    """Notify each affected student that their booking was cancelled.
+
+    Best-effort, AFTER commit: each send is isolated so a blocked user never stops
+    the rest. No general broadcast — the slot is REMOVED (not freed for rebooking),
+    so only the affected student is told, unlike the force-free flow.
+    """
+    for c in cancellations:
+        try:
+            await bot.send_message(
+                c.tg_id,
+                f"🔔 Ваша бронь на {format_dt(c.slot_starts_at)} была отменена преподавателем.",
+            )
+        except Exception:  # noqa: BLE001 - notification is best-effort
+            logger.info(
+                "Could not notify user %s about override cancellation", c.tg_id
+            )
+
+
 @router.callback_query(SlotEditor.picking, TimeCtrlCB.filter(F.action == "done"))
 async def editor_grid_done(
     callback: CallbackQuery,
@@ -418,9 +541,12 @@ async def editor_grid_done(
 ) -> None:
     """Apply the grid selection as a day (or whole-week) override, then re-render.
 
-    Both modes go through :func:`apply_day_override`, which creates newly-selected
-    free slots (skipping past/duplicate), deletes DESELECTED *free* slots via the
-    race-safe ``delete_free_slot`` and PRESERVES booked slots.
+    Both modes go through :func:`apply_day_override`: newly-selected free slots are
+    created (skipping past/duplicate) and deselected FREE slots are deleted via the
+    race-safe ``delete_free_slot``. If any deselected time has an ACTIVE booking,
+    applying would CANCEL it — so this shows a confirmation FIRST (listing the
+    affected bookings) and defers the apply to the confirm handler. With no booked
+    time deselected, the override applies directly.
     """
     if not can_manage_slots(user, settings):
         await state.clear()
@@ -428,48 +554,90 @@ async def editor_grid_done(
         return
 
     data = await state.get_data()
-    mode = data.get("mode", "day")
-    offset = max(0, min(int(data.get("offset", 0)), _EDITOR_MAX_OFFSET))
-    selected = sorted(set(data.get("selected", [])))
+    offset = _pending_offset(data)
+    cancellations = await _pending_cancellations(session, data)
+
+    if cancellations:
+        # Destructive: applying cancels other people's bookings -> confirm first.
+        # The pending selection + context already live in FSM data; just switch
+        # state (aiogram set_state keeps the data) and show the confirmation.
+        await state.set_state(SlotEditor.confirming)
+        await callback.message.edit_text(
+            _confirm_text(data.get("mode", "day"), cancellations),
+            reply_markup=override_confirm_markup(),
+        )
+        await callback.answer()
+        return
+
+    # No booking affected -> apply directly (create + delete-free only).
     duration = get_settings().default_slot_duration_min
-
-    if mode == "week":
-        # Apply the SAME override to every VISIBLE day of the target week.
-        visible = set(visible_weekdays(await get_show_weekends(session)))
-        start_utc, _end = get_week_bounds(offset)
-        monday = to_local(start_utc).date()
-        total_added = total_removed = preserved_count = 0
-        for i in range(7):
-            d = monday + timedelta(days=i)
-            if d.weekday() not in visible:
-                continue
-            added, removed, preserved = await apply_day_override(
-                session, d, selected, callback.from_user.id, duration
-            )
-            total_added += added
-            total_removed += removed
-            preserved_count += len(preserved)
-        summary = (
-            f"Задано на всю неделю: добавлено {total_added}, удалено {total_removed}"
-        )
-        if preserved_count:
-            summary += f", сохранено занятых {preserved_count}"
-        summary += "."
-    else:  # "day"
-        local_date = date_cls.fromisoformat(data["date"])
-        added, removed, preserved = await apply_day_override(
-            session, local_date, selected, callback.from_user.id, duration
-        )
-        summary = (
-            f"{format_day_short(local_date)}: добавлено {added}, удалено {removed}"
-        )
-        if preserved:
-            summary += f", занято (не изменено): {', '.join(preserved)}"
-        summary += "."
-
+    added, removed, _cancelled = await _run_override(
+        session, data, callback.from_user.id, duration
+    )
     await state.clear()
+    summary = _override_summary(data, added, removed, 0)
     text, markup = await _editor_week_view(session, offset, settings)
     await callback.message.edit_text(f"{summary}\n\n{text}", reply_markup=markup)
+    await callback.answer()
+
+
+@router.callback_query(
+    SlotEditor.confirming, SlotOverrideConfirmCB.filter(F.action == "confirm")
+)
+async def editor_confirm_override(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    user: Optional[User],
+    settings: Settings,
+) -> None:
+    """Apply the pending override INCLUDING the booking cancellations, then notify.
+
+    Server-side ``can_manage_slots`` is re-checked here (a role change mid-flow
+    cannot slip through stale callback data). Student notifications are sent AFTER
+    the DB commit + after the teacher's own re-render, best-effort.
+    """
+    if not can_manage_slots(user, settings):
+        await state.clear()
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    offset = _pending_offset(data)
+    duration = get_settings().default_slot_duration_min
+    added, removed, cancelled = await _run_override(
+        session, data, callback.from_user.id, duration
+    )
+    await state.clear()
+    summary = _override_summary(data, added, removed, len(cancelled))
+    text, markup = await _editor_week_view(session, offset, settings)
+    await callback.message.edit_text(f"{summary}\n\n{text}", reply_markup=markup)
+    await callback.answer("Готово.")
+
+    # Best-effort, AFTER the DB commit: tell each affected student directly.
+    await _notify_cancelled(callback.bot, cancelled)
+
+
+@router.callback_query(
+    SlotEditor.confirming, SlotOverrideConfirmCB.filter(F.action == "cancel")
+)
+async def editor_confirm_abort(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    user: Optional[User],
+    settings: Settings,
+) -> None:
+    """Discard the pending override without changes and return to the week editor."""
+    if not can_manage_slots(user, settings):
+        await state.clear()
+        await callback.answer("Недостаточно прав.", show_alert=True)
+        return
+    data = await state.get_data()
+    offset = _pending_offset(data)
+    await state.clear()
+    text, markup = await _editor_week_view(session, offset, settings)
+    await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
 
 
